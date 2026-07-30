@@ -1,0 +1,22 @@
+# Detached from the root workspace (own [workspace] table + own Cargo.lock) so
+# litesvm's solana crate line is resolved independently and cannot break the
+# on-chain `vetrina` crate. Run:  cd tests-litesvm && cargo test -- --nocapture
+# (requires `anchor build` first — the tests load ../target/deploy/vetrina.so).
+[package]
+name = "vetrina-litesvm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dev-dependencies]
+litesvm = "=0.15.1"
+solana-address = "2.6"
+solana-account = "4"
+solana-instruction = "3"
+solana-keypair = "3"
+solana-signer = "3"
+solana-message = "4"
+solana-transaction = "4"
+sha2 = "0.10"
