@@ -1,0 +1,17 @@
+[workspace]
+members = ["programs/*"]
+# The litesvm suite lives in its own detached workspace: litesvm 0.15.1 pulls a
+# solana-sysvar/wincode combination that, when feature-unified with anchor-lang,
+# fails to compile. Keeping it out of this graph protects `cargo test -p vetrina`.
+exclude = ["tests-litesvm"]
+resolver = "2"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[profile.release.build-override]
+opt-level = 3
+incremental = false
+codegen-units = 1

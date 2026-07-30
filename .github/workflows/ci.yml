@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  SOLANA_VERSION: stable
+  ANCHOR_VERSION: "1.0.2"
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure PATH (solana + cargo + avm)
+        run: |
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.avm/bin" >> "$GITHUB_PATH"
+
+      - name: Cargo cache (both workspaces)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tests-litesvm
+
+      - name: Cache Solana + Anchor toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/solana
+            ~/.cache/solana
+            ~/.avm
+            ~/.cargo/bin/avm
+          key: solana-${{ env.SOLANA_VERSION }}-anchor-${{ env.ANCHOR_VERSION }}-${{ runner.os }}
+
+      - name: Install Solana CLI
+        run: |
+          if ! command -v solana >/dev/null; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/${SOLANA_VERSION}/install)"
+          fi
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+          solana --version
+
+      - name: Install Anchor ${{ env.ANCHOR_VERSION }} via avm
+        run: |
+          export PATH="$HOME/.cargo/bin:$HOME/.avm/bin:$PATH"
+          if ! command -v avm >/dev/null; then
+            cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+          fi
+          avm install "${ANCHOR_VERSION}"
+          avm use "${ANCHOR_VERSION}"
+          anchor --version
+
+      - name: Throwaway wallet (anchor build reads the provider wallet)
+        run: |
+          mkdir -p ~/.config/solana
+          [ -f ~/.config/solana/id.json ] || \
+            solana-keygen new --no-bip39-passphrase -s -o ~/.config/solana/id.json
+
+      - name: anchor build
+        # --ignore-keys: the CI-generated deploy keypair need not match the
+        # source declare_id; the .so is built with declare_id (gCxZar2t…), which
+        # is exactly the address the litesvm suite deploys and derives PDAs from.
+        run: anchor build --ignore-keys
+
+      - name: Upload program .so artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vetrina-so
+          path: target/deploy/vetrina.so
+          if-no-files-found: error
+
+      - name: Property tests (cargo test -p vetrina)
+        run: cargo test -p vetrina
+
+      - name: litesvm integration tests (against the built .so)
+        working-directory: tests-litesvm
+        # pipefail so a test failure isn't masked by tee's exit code.
+        run: |
+          set -o pipefail
+          cargo test -- --nocapture 2>&1 | tee litesvm.log
+
+      - name: Compute-units report
+        if: always()
+        run: |
+          {
+            echo "### Compute units per instruction"
+            echo ''
+            echo '```'
+            grep '^CU ' tests-litesvm/litesvm.log 2>/dev/null \
+              || echo "(no CU output — z_report_compute_units did not run)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
