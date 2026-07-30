@@ -1,14 +1,16 @@
 //! litesvm integration tests for the vetrina program.
 //!
-//! These load the compiled on-chain artifact, so build it first:
+//! Build the artifact first:
 //!
-//!     anchor build           # produces target/deploy/vetrina.so + keypair
+//!     anchor build           # -> target/deploy/vetrina.so + keypair
 //!     cd tests-litesvm && cargo test -- --nocapture
 //!
 //! Without the artifact the tests print a SKIP notice and pass, so the crate
 //! stays green in a toolchain-less environment.
 //!
-//! Coverage (task 4):
+//! Every scenario starts from `initialize(treasury, decay, lease_duration)`.
+//!
+//! Coverage (task 4 + j/k/l):
 //!   a. double create_priority on the same mint -> fails
 //!   b. bump with lamports = 0 -> ZeroAmount
 //!   c. sweep with owed = 0 -> NothingToSweep
@@ -17,9 +19,11 @@
 //!   f. claim of the mint already in the vetrina -> AlreadyHolder
 //!   g. bump A, bump B > A, claim B (effective_B -= bar, paid_B unchanged); then
 //!      claim A below the bar -> fails
-//!   h. first-ever claim with effective = 1 -> passes (bar 0)
-//!   i. substitution: a Priority-shaped account at a non-canonical address as
-//!      candidate -> fails at account validation (seeds constraint)
+//!   h. initialize -> create_priority -> bump(1) -> claim (bar 0) -> passes
+//!   i. substituted candidate at a non-canonical address -> seeds constraint
+//!   j. update_config with decay out of cap -> ParamOutOfBounds
+//!   k. update_config signed by a non-authority -> has_one violation
+//!   l. sweep toward an account != config.treasury -> address constraint
 
 use litesvm::types::{FailedTransactionMetadata, TransactionMetadata};
 use litesvm::LiteSVM;
@@ -33,23 +37,30 @@ use solana_signer::Signer;
 use solana_transaction::Transaction;
 
 // Anchor custom-error codes = 6000 + variant index (declaration order in VetrinaError).
-const E_ZERO_AMOUNT: u32 = 6000;
-const E_NOTHING_TO_SWEEP: u32 = 6001;
+const E_PARAM_OUT_OF_BOUNDS: u32 = 6000;
+const E_ZERO_AMOUNT: u32 = 6001;
 const E_BELOW_BAR: u32 = 6002;
 const E_ALREADY_HOLDER: u32 = 6003;
-// Anchor framework: ConstraintSeeds.
+const E_NOTHING_TO_SWEEP: u32 = 6006;
+// Anchor framework constraint codes.
+const E_CONSTRAINT_HAS_ONE: u32 = 2001;
 const E_CONSTRAINT_SEEDS: u32 = 2006;
+const E_CONSTRAINT_ADDRESS: u32 = 2012;
 
 const SPL_TOKEN: Address = address!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const SYSTEM: Address = address!("11111111111111111111111111111111");
-const TREASURY: Address = address!("6omNt7ZZvew6hZn9N3cJpzYczL1F4Gp5azFzfvVKkDyD");
+
+const DECAY: u32 = 3_600;
+const LEASE: i64 = 3_600;
 
 type TxResult = Result<TransactionMetadata, FailedTransactionMetadata>;
 
 struct Env {
     svm: LiteSVM,
     program_id: Address,
+    authority: Keypair,
     payer: Keypair,
+    treasury: Address,
 }
 
 /// Locate the workspace `target/deploy` artifacts. Returns None (with a SKIP
@@ -76,12 +87,17 @@ fn setup() -> Option<Env> {
 
     let mut svm = LiteSVM::new();
     svm.add_program(program_id, &bytes).unwrap();
+    let authority = Keypair::new();
     let payer = Keypair::new();
+    svm.airdrop(&authority.pubkey(), 100_000_000_000).unwrap();
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let treasury = Address::new_unique();
     Some(Env {
         svm,
         program_id,
+        authority,
         payer,
+        treasury,
     })
 }
 
@@ -117,46 +133,79 @@ fn meta(pubkey: Address, signer: bool, writable: bool) -> AccountMeta {
     }
 }
 
-fn event_authority(program_id: Address) -> Address {
-    Address::find_program_address(&[b"__event_authority"], &program_id).0
+fn event_authority(pid: Address) -> Address {
+    Address::find_program_address(&[b"__event_authority"], &pid).0
 }
 
-/// Append the two accounts that `#[event_cpi]` adds at the end of every context.
-fn with_event_cpi(program_id: Address, mut accts: Vec<AccountMeta>) -> Vec<AccountMeta> {
-    accts.push(meta(event_authority(program_id), false, false));
-    accts.push(meta(program_id, false, false));
+/// Append the two accounts that `#[event_cpi]` adds at the end of a context.
+fn with_event_cpi(pid: Address, mut accts: Vec<AccountMeta>) -> Vec<AccountMeta> {
+    accts.push(meta(event_authority(pid), false, false));
+    accts.push(meta(pid, false, false));
     accts
 }
 
-fn priority_pda(program_id: Address, mint: Address) -> (Address, u8) {
-    Address::find_program_address(&[b"priority", mint.as_ref()], &program_id)
+fn config_pda(pid: Address) -> (Address, u8) {
+    Address::find_program_address(&[b"config"], &pid)
 }
 
-fn spotlight_pda(program_id: Address) -> (Address, u8) {
-    Address::find_program_address(&[b"spotlight"], &program_id)
+fn spotlight_pda(pid: Address) -> (Address, u8) {
+    Address::find_program_address(&[b"spotlight"], &pid)
+}
+
+fn priority_pda(pid: Address, mint: Address) -> (Address, u8) {
+    Address::find_program_address(&[b"priority", mint.as_ref()], &pid)
+}
+
+fn ix_initialize(pid: Address, authority: Address, treasury: Address, decay: u32, lease: i64) -> Instruction {
+    let (config, _) = config_pda(pid);
+    let (spotlight, _) = spotlight_pda(pid);
+    let mut data = disc("initialize").to_vec();
+    data.extend_from_slice(treasury.as_ref());
+    data.extend_from_slice(&decay.to_le_bytes());
+    data.extend_from_slice(&lease.to_le_bytes());
+    Instruction {
+        program_id: pid,
+        accounts: vec![
+            meta(authority, true, true),
+            meta(config, false, true),
+            meta(spotlight, false, true),
+            meta(SYSTEM, false, false),
+        ],
+        data,
+    }
+}
+
+fn ix_update_config(pid: Address, authority: Address, treasury: Address, decay: u32, lease: i64) -> Instruction {
+    let (config, _) = config_pda(pid);
+    let mut data = disc("update_config").to_vec();
+    data.extend_from_slice(treasury.as_ref());
+    data.extend_from_slice(&decay.to_le_bytes());
+    data.extend_from_slice(&lease.to_le_bytes());
+    Instruction {
+        program_id: pid,
+        accounts: vec![meta(authority, true, true), meta(config, false, true)],
+        data,
+    }
 }
 
 fn ix_create_priority(pid: Address, payer: Address, mint: Address) -> Instruction {
     let (priority, _) = priority_pda(pid, mint);
     Instruction {
         program_id: pid,
-        accounts: with_event_cpi(
-            pid,
-            vec![
-                meta(payer, true, true),
-                meta(mint, false, false),
-                meta(priority, false, true),
-                meta(SYSTEM, false, false),
-            ],
-        ),
+        accounts: vec![
+            meta(payer, true, true),
+            meta(mint, false, false),
+            meta(priority, false, true),
+            meta(SYSTEM, false, false),
+        ],
         data: disc("create_priority").to_vec(),
     }
 }
 
-fn ix_bump(pid: Address, payer: Address, mint: Address, amount: u64) -> Instruction {
+fn ix_bump(pid: Address, payer: Address, mint: Address, lamports: u64) -> Instruction {
     let (priority, _) = priority_pda(pid, mint);
     let mut data = disc("bump").to_vec();
-    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&lamports.to_le_bytes());
     Instruction {
         program_id: pid,
         accounts: with_event_cpi(
@@ -171,7 +220,25 @@ fn ix_bump(pid: Address, payer: Address, mint: Address, amount: u64) -> Instruct
     }
 }
 
+fn ix_sweep(pid: Address, mint: Address, treasury: Address) -> Instruction {
+    let (config, _) = config_pda(pid);
+    let (priority, _) = priority_pda(pid, mint);
+    Instruction {
+        program_id: pid,
+        accounts: with_event_cpi(
+            pid,
+            vec![
+                meta(config, false, false),
+                meta(priority, false, true),
+                meta(treasury, false, true),
+            ],
+        ),
+        data: disc("sweep").to_vec(),
+    }
+}
+
 fn ix_claim(pid: Address, payer: Address, candidate_mint: Address) -> Instruction {
+    let (config, _) = config_pda(pid);
     let (spotlight, _) = spotlight_pda(pid);
     let (candidate, _) = priority_pda(pid, candidate_mint);
     Instruction {
@@ -180,32 +247,24 @@ fn ix_claim(pid: Address, payer: Address, candidate_mint: Address) -> Instructio
             pid,
             vec![
                 meta(payer, true, true),
+                meta(config, false, false),
                 meta(spotlight, false, true),
                 meta(candidate, false, true),
-                meta(SYSTEM, false, false),
             ],
         ),
         data: disc("claim_spotlight").to_vec(),
     }
 }
 
-fn ix_sweep(pid: Address, mint: Address) -> Instruction {
-    let (priority, _) = priority_pda(pid, mint);
-    Instruction {
-        program_id: pid,
-        accounts: with_event_cpi(
-            pid,
-            vec![meta(priority, false, true), meta(TREASURY, false, true)],
-        ),
-        data: disc("sweep").to_vec(),
-    }
+fn send(svm: &mut LiteSVM, ix: Instruction, signer: &Keypair) -> TxResult {
+    let msg = Message::new(&[ix], Some(&signer.pubkey()));
+    let tx = Transaction::new(&[signer], msg, svm.latest_blockhash());
+    svm.send_transaction(tx)
 }
 
-fn send(env: &mut Env, ix: Instruction) -> TxResult {
-    let payer_pk = env.payer.pubkey();
-    let msg = Message::new(&[ix], Some(&payer_pk));
-    let tx = Transaction::new(&[&env.payer], msg, env.svm.latest_blockhash());
-    env.svm.send_transaction(tx)
+fn init(env: &mut Env, decay: u32, lease: i64) -> TxResult {
+    let ix = ix_initialize(env.program_id, env.authority.pubkey(), env.treasury, decay, lease);
+    send(&mut env.svm, ix, &env.authority)
 }
 
 fn assert_custom(res: TxResult, code: u32) {
@@ -260,8 +319,8 @@ fn priority_lamports(env: &Env, mint: Address) -> u64 {
     env.svm.get_account(&pda).map(|a| a.lamports).unwrap_or(0)
 }
 
-fn treasury_lamports(env: &Env) -> u64 {
-    env.svm.get_account(&TREASURY).map(|a| a.lamports).unwrap_or(0)
+fn lamports_of(env: &Env, addr: Address) -> u64 {
+    env.svm.get_account(&addr).map(|a| a.lamports).unwrap_or(0)
 }
 
 // ---- tests ----------------------------------------------------------------
@@ -269,59 +328,63 @@ fn treasury_lamports(env: &Env) -> u64 {
 #[test]
 fn a_double_create_priority_fails() {
     let Some(mut env) = setup() else { return };
+    init(&mut env, DECAY, LEASE).expect("initialize");
     let (pid, payer) = (env.program_id, env.payer.pubkey());
     let mint = create_mint(&mut env);
-    send(&mut env, ix_create_priority(pid, payer, mint)).expect("first create ok");
-    let second = send(&mut env, ix_create_priority(pid, payer, mint));
+    send(&mut env.svm, ix_create_priority(pid, payer, mint), &env.payer).expect("first create ok");
+    let second = send(&mut env.svm, ix_create_priority(pid, payer, mint), &env.payer);
     assert!(second.is_err(), "second create_priority must fail (init)");
 }
 
 #[test]
 fn b_bump_zero_is_zero_amount() {
     let Some(mut env) = setup() else { return };
+    init(&mut env, DECAY, LEASE).expect("initialize");
     let (pid, payer) = (env.program_id, env.payer.pubkey());
     let mint = create_mint(&mut env);
-    send(&mut env, ix_create_priority(pid, payer, mint)).expect("create ok");
-    let res = send(&mut env, ix_bump(pid, payer, mint, 0));
+    send(&mut env.svm, ix_create_priority(pid, payer, mint), &env.payer).expect("create ok");
+    let res = send(&mut env.svm, ix_bump(pid, payer, mint, 0), &env.payer);
     assert_custom(res, E_ZERO_AMOUNT);
 }
 
 #[test]
 fn c_sweep_owed_zero_is_nothing_to_sweep() {
     let Some(mut env) = setup() else { return };
-    let (pid, payer) = (env.program_id, env.payer.pubkey());
+    init(&mut env, DECAY, LEASE).expect("initialize");
+    let (pid, payer, treasury) = (env.program_id, env.payer.pubkey(), env.treasury);
     let mint = create_mint(&mut env);
-    send(&mut env, ix_create_priority(pid, payer, mint)).expect("create ok");
-    let res = send(&mut env, ix_sweep(pid, mint));
+    send(&mut env.svm, ix_create_priority(pid, payer, mint), &env.payer).expect("create ok");
+    let res = send(&mut env.svm, ix_sweep(pid, mint, treasury), &env.payer);
     assert_custom(res, E_NOTHING_TO_SWEEP);
 }
 
 #[test]
 fn d_sweep_after_bump_moves_exact_owed() {
     let Some(mut env) = setup() else { return };
-    let (pid, payer) = (env.program_id, env.payer.pubkey());
+    init(&mut env, DECAY, LEASE).expect("initialize");
+    let (pid, payer, treasury) = (env.program_id, env.payer.pubkey(), env.treasury);
     let mint = create_mint(&mut env);
-    send(&mut env, ix_create_priority(pid, payer, mint)).expect("create ok");
+    send(&mut env.svm, ix_create_priority(pid, payer, mint), &env.payer).expect("create ok");
 
     let amount = 5_000_000u64;
-    send(&mut env, ix_bump(pid, payer, mint, amount)).expect("bump ok");
+    send(&mut env.svm, ix_bump(pid, payer, mint, amount), &env.payer).expect("bump ok");
 
     // Ensure the treasury account exists so we can measure the delta cleanly.
-    env.svm.airdrop(&TREASURY, 1_000_000).unwrap();
-    let treasury_before = treasury_lamports(&env);
+    env.svm.airdrop(&treasury, 1_000_000).unwrap();
+    let treasury_before = lamports_of(&env, treasury);
     let rent_min = {
         let (pda, _) = priority_pda(pid, mint);
         let len = env.svm.get_account(&pda).unwrap().data.len();
         env.svm.minimum_balance_for_rent_exemption(len)
     };
 
-    send(&mut env, ix_sweep(pid, mint)).expect("sweep ok");
+    send(&mut env.svm, ix_sweep(pid, mint, treasury), &env.payer).expect("sweep ok");
 
     let (paid, _eff, swept) = read_priority(&env, mint);
     assert_eq!(swept, paid, "I8: swept advances to paid");
     assert_eq!(swept, amount, "swept equals the bumped amount");
     assert_eq!(
-        treasury_lamports(&env) - treasury_before,
+        lamports_of(&env, treasury) - treasury_before,
         amount,
         "treasury receives exactly owed"
     );
@@ -335,67 +398,72 @@ fn d_sweep_after_bump_moves_exact_owed() {
 #[test]
 fn e_claim_below_bar_fails() {
     let Some(mut env) = setup() else { return };
+    init(&mut env, DECAY, LEASE).expect("initialize");
     let (pid, payer) = (env.program_id, env.payer.pubkey());
     // Establish a holder A with a full bar during its lease.
     let a = create_mint(&mut env);
-    send(&mut env, ix_create_priority(pid, payer, a)).expect("create a");
-    send(&mut env, ix_bump(pid, payer, a, 100)).expect("bump a");
-    send(&mut env, ix_claim(pid, payer, a)).expect("claim a (bar 0)");
+    send(&mut env.svm, ix_create_priority(pid, payer, a), &env.payer).expect("create a");
+    send(&mut env.svm, ix_bump(pid, payer, a, 100), &env.payer).expect("bump a");
+    send(&mut env.svm, ix_claim(pid, payer, a), &env.payer).expect("claim a (bar 0)");
 
     // B with effective below the (now full) bar.
     let b = create_mint(&mut env);
-    send(&mut env, ix_create_priority(pid, payer, b)).expect("create b");
-    send(&mut env, ix_bump(pid, payer, b, 50)).expect("bump b");
-    let res = send(&mut env, ix_claim(pid, payer, b));
+    send(&mut env.svm, ix_create_priority(pid, payer, b), &env.payer).expect("create b");
+    send(&mut env.svm, ix_bump(pid, payer, b, 50), &env.payer).expect("bump b");
+    let res = send(&mut env.svm, ix_claim(pid, payer, b), &env.payer);
     assert_custom(res, E_BELOW_BAR);
 }
 
 #[test]
 fn f_claim_already_holder_fails() {
     let Some(mut env) = setup() else { return };
+    init(&mut env, DECAY, LEASE).expect("initialize");
     let (pid, payer) = (env.program_id, env.payer.pubkey());
     let a = create_mint(&mut env);
-    send(&mut env, ix_create_priority(pid, payer, a)).expect("create a");
-    send(&mut env, ix_bump(pid, payer, a, 100)).expect("bump a");
-    send(&mut env, ix_claim(pid, payer, a)).expect("claim a");
+    send(&mut env.svm, ix_create_priority(pid, payer, a), &env.payer).expect("create a");
+    send(&mut env.svm, ix_bump(pid, payer, a, 100), &env.payer).expect("bump a");
+    send(&mut env.svm, ix_claim(pid, payer, a), &env.payer).expect("claim a");
     // A is already the holder -> I3.
-    let res = send(&mut env, ix_claim(pid, payer, a));
+    let res = send(&mut env.svm, ix_claim(pid, payer, a), &env.payer);
     assert_custom(res, E_ALREADY_HOLDER);
 }
 
 #[test]
 fn g_claim_consumes_bar_then_a_below_bar_fails() {
     let Some(mut env) = setup() else { return };
+    init(&mut env, DECAY, LEASE).expect("initialize");
     let (pid, payer) = (env.program_id, env.payer.pubkey());
     let a = create_mint(&mut env);
     let b = create_mint(&mut env);
-    send(&mut env, ix_create_priority(pid, payer, a)).expect("create a");
-    send(&mut env, ix_create_priority(pid, payer, b)).expect("create b");
-    send(&mut env, ix_bump(pid, payer, a, 30)).expect("bump a");
-    send(&mut env, ix_bump(pid, payer, b, 50)).expect("bump b");
+    send(&mut env.svm, ix_create_priority(pid, payer, a), &env.payer).expect("create a");
+    send(&mut env.svm, ix_create_priority(pid, payer, b), &env.payer).expect("create b");
+    send(&mut env.svm, ix_bump(pid, payer, a, 30), &env.payer).expect("bump a");
+    send(&mut env.svm, ix_bump(pid, payer, b, 50), &env.payer).expect("bump b");
 
     let (paid_b_before, eff_b_before, _) = read_priority(&env, b);
     assert_eq!((paid_b_before, eff_b_before), (50, 50));
 
     // First claim -> bar is 0, so effective_B is decremented by 0, paid_B unchanged (I1/I4).
-    send(&mut env, ix_claim(pid, payer, b)).expect("claim b");
+    send(&mut env.svm, ix_claim(pid, payer, b), &env.payer).expect("claim b");
     let (paid_b, eff_b, _) = read_priority(&env, b);
     assert_eq!(paid_b, 50, "I1: paid_B unchanged by claim");
     assert_eq!(eff_b, 50, "effective_B == paid_B - bar(0)");
 
     // B now holds with a full bar (50); A (30) is below it.
-    let res = send(&mut env, ix_claim(pid, payer, a));
+    let res = send(&mut env.svm, ix_claim(pid, payer, a), &env.payer);
     assert_custom(res, E_BELOW_BAR);
 }
 
 #[test]
 fn h_first_claim_effective_one_passes() {
     let Some(mut env) = setup() else { return };
+    init(&mut env, DECAY, LEASE).expect("initialize");
     let (pid, payer) = (env.program_id, env.payer.pubkey());
     let m = create_mint(&mut env);
-    send(&mut env, ix_create_priority(pid, payer, m)).expect("create");
-    send(&mut env, ix_bump(pid, payer, m, 1)).expect("bump 1");
-    send(&mut env, ix_claim(pid, payer, m)).expect("first claim with effective=1 must pass (bar 0)");
+    send(&mut env.svm, ix_create_priority(pid, payer, m), &env.payer).expect("create");
+    send(&mut env.svm, ix_bump(pid, payer, m, 1), &env.payer).expect("bump 1");
+    send(&mut env.svm, ix_claim(pid, payer, m), &env.payer)
+        .expect("first claim with effective=1 must pass (bar 0)");
 
     let (spotlight, _) = spotlight_pda(pid);
     let s = env.svm.get_account(&spotlight).expect("spotlight");
@@ -406,19 +474,20 @@ fn h_first_claim_effective_one_passes() {
 #[test]
 fn i_substituted_candidate_fails_validation() {
     let Some(mut env) = setup() else { return };
+    init(&mut env, DECAY, LEASE).expect("initialize");
     let (pid, payer) = (env.program_id, env.payer.pubkey());
     let a = create_mint(&mut env);
-    send(&mut env, ix_create_priority(pid, payer, a)).expect("create a");
-    send(&mut env, ix_bump(pid, payer, a, 100)).expect("bump a");
+    send(&mut env.svm, ix_create_priority(pid, payer, a), &env.payer).expect("create a");
+    send(&mut env.svm, ix_bump(pid, payer, a, 100), &env.payer).expect("bump a");
 
     // Copy A's real Priority data to a NON-canonical address and pass that as
-    // the candidate. Anchor re-derives [b"priority", mint] and rejects the
-    // mismatch (seeds constraint).
+    // the candidate. Anchor re-derives [b"priority", mint] and rejects it.
     let (real_pda, _) = priority_pda(pid, a);
     let real = env.svm.get_account(&real_pda).unwrap();
     let fake_addr = Address::new_unique();
     env.svm.set_account(fake_addr, real).unwrap();
 
+    let (config, _) = config_pda(pid);
     let (spotlight, _) = spotlight_pda(pid);
     let ix = Instruction {
         program_id: pid,
@@ -426,29 +495,71 @@ fn i_substituted_candidate_fails_validation() {
             pid,
             vec![
                 meta(payer, true, true),
+                meta(config, false, false),
                 meta(spotlight, false, true),
                 meta(fake_addr, false, true), // substituted candidate
-                meta(SYSTEM, false, false),
             ],
         ),
         data: disc("claim_spotlight").to_vec(),
     };
-    let res = send(&mut env, ix);
+    let res = send(&mut env.svm, ix, &env.payer);
     assert_custom(res, E_CONSTRAINT_SEEDS);
+}
+
+#[test]
+fn j_update_config_out_of_cap_fails() {
+    let Some(mut env) = setup() else { return };
+    init(&mut env, DECAY, LEASE).expect("initialize");
+    let (pid, authority, treasury) = (env.program_id, env.authority.pubkey(), env.treasury);
+    // decay = 30 < MIN_DECAY_SECS (60).
+    let ix = ix_update_config(pid, authority, treasury, 30, LEASE);
+    let res = send(&mut env.svm, ix, &env.authority);
+    assert_custom(res, E_PARAM_OUT_OF_BOUNDS);
+}
+
+#[test]
+fn k_update_config_non_authority_fails() {
+    let Some(mut env) = setup() else { return };
+    init(&mut env, DECAY, LEASE).expect("initialize");
+    let (pid, treasury) = (env.program_id, env.treasury);
+    // A funded impostor signs, but it is not config.authority.
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let ix = ix_update_config(pid, attacker.pubkey(), treasury, DECAY, LEASE);
+    let res = send(&mut env.svm, ix, &attacker);
+    assert_custom(res, E_CONSTRAINT_HAS_ONE);
+}
+
+#[test]
+fn l_sweep_wrong_treasury_fails() {
+    let Some(mut env) = setup() else { return };
+    init(&mut env, DECAY, LEASE).expect("initialize");
+    let (pid, payer) = (env.program_id, env.payer.pubkey());
+    let mint = create_mint(&mut env);
+    send(&mut env.svm, ix_create_priority(pid, payer, mint), &env.payer).expect("create");
+    send(&mut env.svm, ix_bump(pid, payer, mint, 5_000_000), &env.payer).expect("bump");
+
+    // Sweep toward an address != config.treasury.
+    let wrong = Address::new_unique();
+    env.svm.airdrop(&wrong, 1_000_000).unwrap();
+    let res = send(&mut env.svm, ix_sweep(pid, mint, wrong), &env.payer);
+    assert_custom(res, E_CONSTRAINT_ADDRESS);
 }
 
 /// Report compute units for the happy path (task 6). Prints with --nocapture.
 #[test]
 fn z_report_compute_units() {
     let Some(mut env) = setup() else { return };
-    let (pid, payer) = (env.program_id, env.payer.pubkey());
+    let cu_init = init(&mut env, DECAY, LEASE).unwrap().compute_units_consumed;
+    let (pid, payer, treasury) = (env.program_id, env.payer.pubkey(), env.treasury);
     let m = create_mint(&mut env);
 
-    let cu_create = send(&mut env, ix_create_priority(pid, payer, m)).unwrap().compute_units_consumed;
-    let cu_bump = send(&mut env, ix_bump(pid, payer, m, 10_000_000)).unwrap().compute_units_consumed;
-    let cu_claim = send(&mut env, ix_claim(pid, payer, m)).unwrap().compute_units_consumed;
-    let cu_sweep = send(&mut env, ix_sweep(pid, m)).unwrap().compute_units_consumed;
+    let cu_create = send(&mut env.svm, ix_create_priority(pid, payer, m), &env.payer).unwrap().compute_units_consumed;
+    let cu_bump = send(&mut env.svm, ix_bump(pid, payer, m, 10_000_000), &env.payer).unwrap().compute_units_consumed;
+    let cu_claim = send(&mut env.svm, ix_claim(pid, payer, m), &env.payer).unwrap().compute_units_consumed;
+    let cu_sweep = send(&mut env.svm, ix_sweep(pid, m, treasury), &env.payer).unwrap().compute_units_consumed;
 
+    eprintln!("CU  initialize      = {cu_init}");
     eprintln!("CU  create_priority = {cu_create}");
     eprintln!("CU  bump            = {cu_bump}");
     eprintln!("CU  claim_spotlight = {cu_claim}");

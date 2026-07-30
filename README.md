@@ -21,14 +21,20 @@ Anchor.toml                anchor_version = 1.0.2
 
 | ix | permission | notes |
 |----|------------|-------|
+| `initialize(treasury, decay, lease_duration)` | authority | `init`s `Config` (holds `treasury`/`decay`/`lease_duration`, capped) **and** `Spotlight` (pure `init`) |
+| `update_config(treasury, decay, lease_duration)` | authority (`has_one`) | re-set params inside the compile-time caps; out-of-range → `ParamOutOfBounds` |
 | `create_priority` | `init` (never `init_if_needed`) | one per mint; validates the mint via `InterfaceAccount<Mint>` |
-| `bump(amount)` | signer pays | deposits lamports, grows `paid` **and** `effective` together (I17); `amount == 0` → `ZeroAmount` |
+| `bump(lamports)` | signer pays | deposits lamports, grows `paid` **and** `effective` together (I17); `0` → `ZeroAmount` |
 | `claim_spotlight` | **permissionless** | needs `effective > bar(now)` (I2); consumes the bar out of `effective`, snapshots the remainder (I4) |
-| `sweep` | **permissionless** | moves `paid - swept` to the fixed treasury; checks `lamports >= rent_min + owed` **before** moving (I7) |
+| `sweep` | **permissionless** | moves `paid - swept` to `config.treasury` (`address =`); checks `lamports >= rent_min + owed` first (I7) |
 
-`bar()` — the decaying entry bar: full during the lease (P1), zero after full
-decay (P2), monotone non-increasing (P3), never above `paid_snapshot` (P4). At
-`now == lease_end` exactly the bar is **full** (`elapsed == 0`), by design.
+Parameter caps (compile-time, `update_config` cannot escape them): `decay`
+∈ [60 s, 30 d], `lease_duration` ∈ [60 s, 30 d].
+
+`bar(paid_snapshot, lease_end, now, decay)` — the decaying threshold: full while
+`now < lease_end` (P1), zero once `now >= lease_end + decay` (P2), monotone
+non-increasing (P3), never above `paid_snapshot` (P4). At `now == lease_end` it
+enters the decay branch with `elapsed == 0`, i.e. still **full**.
 
 ## Build
 
@@ -56,16 +62,19 @@ cargo test -p vetrina
 cd tests-litesvm && cargo test -- --nocapture
 ```
 
-The litesvm suite covers: double `create_priority` (a), `bump 0` → `ZeroAmount`
-(b), `sweep` with `owed == 0` → `NothingToSweep` (c), `sweep` after `bump` moves
-the exact `owed` and leaves the PDA rent-exempt with `swept == paid` (d), claim
-below the bar → `BelowBar` (e), claiming the current holder → `AlreadyHolder`
-(f), the bump-A/bump-B/claim-B consumption sequence then claim-A-below-bar (g),
-first-ever claim with `effective = 1` (h), and the substituted-candidate seeds
-guard (i). `z_report_compute_units` prints CU per instruction (task 6).
+Every litesvm scenario starts from `initialize(treasury, decay, lease_duration)`.
+Coverage: double `create_priority` (a); `bump 0` → `ZeroAmount` (b); `sweep`
+with `owed == 0` → `NothingToSweep` (c); `sweep` after `bump` moves exactly
+`owed`, leaves the PDA rent-exempt, `swept == paid` (d); claim below the bar →
+`BelowBar` (e); claiming the current holder → `AlreadyHolder` (f); the
+bump-A/bump-B/claim-B consumption sequence then claim-A-below-bar (g); first
+claim `initialize → create_priority → bump(1) → claim` with bar 0 (h); the
+substituted-candidate seeds guard (i); `update_config` out of cap →
+`ParamOutOfBounds` (j); `update_config` from a non-authority → `has_one` (k);
+`sweep` toward a non-`config.treasury` account → `address` constraint (l).
+`z_report_compute_units` prints CU per instruction (task 6).
 
-Without the `.so` the litesvm tests print a `SKIP` notice and pass, so the crate
-stays green before a build.
+Without the `.so` the litesvm tests print a `SKIP` notice and pass.
 
 ## Program ID / keys sync
 
@@ -106,19 +115,27 @@ the on-chain hash is reproducible independent of the host toolchain.
 
 | crate | version |
 |-------|---------|
-| anchor-lang | **1.0.2** (features `event-cpi`, `init-if-needed`) |
+| anchor-lang | **1.0.2** (feature `event-cpi`) |
 | anchor-spl | **1.0.2** (`token`, `token_2022` — for `InterfaceAccount<Mint>`) |
 | solana-* (via anchor) | 3.x modular crates |
 | proptest | 1.x |
 | litesvm | **0.15.1** |
 
 `anchor-spl` 1.0.2 exists on crates.io, so `InterfaceAccount<Mint>` is kept (the
-`AccountInfo` + owner-check fallback from task 1 was unnecessary).
+`AccountInfo` fallback from the original task 1 was unnecessary).
+
+### One adaptation vs. the delivered `lib.rs`
+
+The delivered file called `CpiContext::new(system_program.to_account_info(), …)`
+in `bump` — an older-Anchor signature. On **anchor-lang 1.0.2** `CpiContext::new`
+takes the program **`Pubkey`**, so that single argument is `system_program.key()`.
+Same System Program, same CPI, no semantic change; it is the only line that
+differs from the reference.
 
 ### litesvm dependency pinning
 
 `litesvm 0.15.1` targets the `wincode 0.5` generation of the split `solana-*`
-crates, but several of them shipped a later patch on `wincode 0.6`. The detached
+crates, but several shipped a later patch on `wincode 0.6`. The detached
 `tests-litesvm/Cargo.lock` pins the last `wincode 0.5` patch of each affected
 crate so the host build resolves cleanly:
 
