@@ -15,6 +15,8 @@ programs/vetrina/          Anchor program (anchor-lang 1.0.2, feature event-cpi)
   tests/properties.rs      proptests P1–P4 + edge cases (pure, no artifact needed)
 tests-litesvm/             litesvm integration suite (detached workspace, see below)
 Anchor.toml                anchor_version = 1.0.2
+.github/workflows/ci.yml   build .so, run both suites against it, report CU
+
 ```
 
 ## Instructions
@@ -85,8 +87,10 @@ carry the synced id:
 gCxZar2tTSVKE1amCvMW5BcjMXvbqGRCf52n5P15gM4
 ```
 
-The litesvm tests read the program id from `target/deploy/vetrina-keypair.json`
-at runtime, so they follow any future re-sync automatically.
+The litesvm tests deploy the `.so` at this **declared** id (a `PROGRAM_ID`
+constant kept equal to `declare_id!`), not at the `target/deploy` keypair — a
+fresh `anchor build` mints a random keypair that need not match `declare_id`,
+and the baked-in `declare_id` is what the program derives its PDAs from.
 
 ## Reproducible (verifiable) build — solana-verify
 

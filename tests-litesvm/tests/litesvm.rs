@@ -47,6 +47,11 @@ const E_CONSTRAINT_HAS_ONE: u32 = 2001;
 const E_CONSTRAINT_SEEDS: u32 = 2006;
 const E_CONSTRAINT_ADDRESS: u32 = 2012;
 
+// Must equal `declare_id!` in programs/vetrina/src/lib.rs: the compiled .so has
+// this id baked in, so we deploy it here and derive every PDA from it. (The
+// target/deploy keypair is only for real on-chain deploy and may not match it
+// on a fresh CI build — declare_id is the source of truth.)
+const PROGRAM_ID: Address = address!("gCxZar2tTSVKE1amCvMW5BcjMXvbqGRCf52n5P15gM4");
 const SPL_TOKEN: Address = address!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const SYSTEM: Address = address!("11111111111111111111111111111111");
 
@@ -63,13 +68,10 @@ struct Env {
     treasury: Address,
 }
 
-/// Locate the workspace `target/deploy` artifacts. Returns None (with a SKIP
-/// notice) when they are absent, so the crate stays green pre-build.
+/// Load the compiled program at its declared id. Returns None (with a SKIP
+/// notice) when the .so is absent, so the crate stays green pre-build.
 fn setup() -> Option<Env> {
-    let deploy = format!("{}/../target/deploy", env!("CARGO_MANIFEST_DIR"));
-    let so = format!("{deploy}/vetrina.so");
-    let keypair = format!("{deploy}/vetrina-keypair.json");
-
+    let so = format!("{}/../target/deploy/vetrina.so", env!("CARGO_MANIFEST_DIR"));
     let bytes = match std::fs::read(&so) {
         Ok(b) => b,
         Err(_) => {
@@ -77,16 +79,9 @@ fn setup() -> Option<Env> {
             return None;
         }
     };
-    let program_id = match std::fs::read_to_string(&keypair) {
-        Ok(s) => program_id_from_keypair_json(&s),
-        Err(_) => {
-            eprintln!("SKIP: {keypair} not found — run `anchor build` first");
-            return None;
-        }
-    };
 
     let mut svm = LiteSVM::new();
-    svm.add_program(program_id, &bytes).unwrap();
+    svm.add_program(PROGRAM_ID, &bytes).unwrap();
     let authority = Keypair::new();
     let payer = Keypair::new();
     svm.airdrop(&authority.pubkey(), 100_000_000_000).unwrap();
@@ -94,26 +89,11 @@ fn setup() -> Option<Env> {
     let treasury = Address::new_unique();
     Some(Env {
         svm,
-        program_id,
+        program_id: PROGRAM_ID,
         authority,
         payer,
         treasury,
     })
-}
-
-fn program_id_from_keypair_json(s: &str) -> Address {
-    // Solana keypair JSON is a 64-byte array; the public key is the last 32.
-    let nums: Vec<u8> = s
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .split(',')
-        .filter_map(|t| t.trim().parse::<u8>().ok())
-        .collect();
-    assert_eq!(nums.len(), 64, "keypair json must hold 64 bytes");
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&nums[32..64]);
-    Address::from(pk)
 }
 
 // ---- instruction encoding -------------------------------------------------
