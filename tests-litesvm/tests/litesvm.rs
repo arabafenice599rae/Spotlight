@@ -237,6 +237,10 @@ fn ix_claim(pid: Address, payer: Address, candidate_mint: Address) -> Instructio
 }
 
 fn send(svm: &mut LiteSVM, ix: Instruction, signer: &Keypair) -> TxResult {
+    // Advance the blockhash so otherwise-identical transactions (e.g. a repeated
+    // claim/create) get distinct signatures and are not rejected as duplicates
+    // (AlreadyProcessed) before the program runs.
+    svm.expire_blockhash();
     let msg = Message::new(&[ix], Some(&signer.pubkey()));
     let tx = Transaction::new(&[signer], msg, svm.latest_blockhash());
     svm.send_transaction(tx)

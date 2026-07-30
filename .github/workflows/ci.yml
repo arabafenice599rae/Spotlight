@@ -82,7 +82,10 @@ jobs:
 
       - name: litesvm integration tests (against the built .so)
         working-directory: tests-litesvm
-        run: cargo test -- --nocapture 2>&1 | tee litesvm.log
+        # pipefail so a test failure isn't masked by tee's exit code.
+        run: |
+          set -o pipefail
+          cargo test -- --nocapture 2>&1 | tee litesvm.log
 
       - name: Compute-units report
         if: always()
