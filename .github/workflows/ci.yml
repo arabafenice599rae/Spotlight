@@ -65,7 +65,10 @@ jobs:
             solana-keygen new --no-bip39-passphrase -s -o ~/.config/solana/id.json
 
       - name: anchor build
-        run: anchor build
+        # --ignore-keys: the CI-generated deploy keypair need not match the
+        # source declare_id; the .so is built with declare_id (gCxZar2t…), which
+        # is exactly the address the litesvm suite deploys and derives PDAs from.
+        run: anchor build --ignore-keys
 
       - name: Upload program .so artifact
         uses: actions/upload-artifact@v4
