@@ -1,0 +1,24 @@
+{
+  "name": "spotlight-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Devnet client + DBC config for the Spotlight vetrina launchpad",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "create-config": "tsx src/create-config.ts",
+    "e2e": "tsx src/e2e.ts"
+  },
+  "dependencies": {
+    "@meteora-ag/dynamic-bonding-curve-sdk": "^1.5.11",
+    "@solana/web3.js": "^1.98.0",
+    "@coral-xyz/anchor": "^0.30.1",
+    "bn.js": "^5.2.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0",
+    "@types/bn.js": "^5.1.5"
+  }
+}
