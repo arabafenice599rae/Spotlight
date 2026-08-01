@@ -71,7 +71,7 @@ jobs:
         run: anchor build --ignore-keys
 
       - name: Upload program .so artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vetrina-so
           path: target/deploy/vetrina.so
