@@ -10,7 +10,7 @@
     "e2e": "tsx src/e2e.ts"
   },
   "dependencies": {
-    "@meteora-ag/dynamic-bonding-curve-sdk": "^1.5.11",
+    "@meteora-ag/dynamic-bonding-curve-sdk": "^1.5.13",
     "@solana/web3.js": "^1.98.0",
     "@coral-xyz/anchor": "^0.32.1",
     "bn.js": "^5.2.1"
